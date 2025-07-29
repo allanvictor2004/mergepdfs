@@ -1,58 +1,67 @@
-# from fastapi import FastAPI, UploadFile, File
-# from fastapi.responses import FileResponse
-# from typing import List
-# import os
-# from PyPDF2 import PdfMerger
-# import uuid
-
-# app = FastAPI()
-
-# @app.post("/merge-pdfs")
-# async def merge_pdfs(files: List[UploadFile] = File(...)):
-#     merger = PdfMerger()
-#     temp_files = []
-
-#     for file in files:
-#         temp_path = f"/tmp/{uuid.uuid4()}.pdf"
-#         with open(temp_path, "wb") as f:
-#             f.write(await file.read())
-#         merger.append(temp_path)
-#         temp_files.append(temp_path)
-
-#     output_path = "/tmp/merged_output.pdf"
-#     merger.write(output_path)
-#     merger.close()
-
-#     for temp_file in temp_files:
-#         os.remove(temp_file)
-
-#     return FileResponse(output_path, filename="merged.pdf", media_type="application/pdf")
-
-from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
+from fastapi.responses import FileResponse, JSONResponse
 from typing import List
 from PyPDF2 import PdfMerger
+import uuid
+import os
 import io
 
 app = FastAPI()
 
+# Pasta temporária para salvar PDFs
+TEMP_DIR = "/tmp/pdf_merge"
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+tasks_status = {}  # {task_id: "pending" | "done" | "error"}
+
+def process_merge(task_id: str, files_content: List[bytes]):
+    """Função que faz o merge em segundo plano."""
+    try:
+        merger = PdfMerger()
+        for content in files_content:
+            merger.append(io.BytesIO(content))
+
+        output_path = os.path.join(TEMP_DIR, f"{task_id}.pdf")
+        with open(output_path, "wb") as f:
+            merger.write(f)
+
+        merger.close()
+        tasks_status[task_id] = "done"
+    except Exception as e:
+        tasks_status[task_id] = "error"
+        print(f"Erro no merge: {e}")
+
 @app.post("/merge-pdfs")
-async def merge_pdfs(files: List[UploadFile] = File(...)):
-    merger = PdfMerger()
+async def merge_pdfs(background_tasks: BackgroundTasks, files: List[UploadFile] = File(...)):
+    # Gera um ID único para a tarefa
+    task_id = str(uuid.uuid4())
+    tasks_status[task_id] = "pending"
 
-    # Adiciona os arquivos diretamente do upload ao merger
-    for file in files:
-        file_content = await file.read()
-        merger.append(io.BytesIO(file_content))
+    # Lê os arquivos (conteúdo em memória)
+    files_content = [await file.read() for file in files]
 
-    # Escreve o PDF consolidado em memória (BytesIO)
-    output_pdf = io.BytesIO()
-    merger.write(output_pdf)
-    merger.close()
-    output_pdf.seek(0)  # Move para o início do arquivo
+    # Chama o processamento em background
+    background_tasks.add_task(process_merge, task_id, files_content)
 
-    return StreamingResponse(
-        output_pdf,
-        media_type="application/pdf",
-        headers={"Content-Disposition": "attachment; filename=merged.pdf"}
-    )
+    return {"task_id": task_id, "status": "pending", "download_url": f"/download/{task_id}"}
+
+@app.get("/status/{task_id}")
+async def check_status(task_id: str):
+    status = tasks_status.get(task_id)
+    if not status:
+        raise HTTPException(status_code=404, detail="Tarefa não encontrada")
+    return {"task_id": task_id, "status": status}
+
+@app.get("/download/{task_id}")
+async def download_file(task_id: str):
+    status = tasks_status.get(task_id)
+    if not status:
+        raise HTTPException(status_code=404, detail="Tarefa não encontrada")
+    if status != "done":
+        return JSONResponse({"message": "Arquivo ainda não está pronto. Verifique o status."})
+
+    output_path = os.path.join(TEMP_DIR, f"{task_id}.pdf")
+    if not os.path.exists(output_path):
+        raise HTTPException(status_code=404, detail="Arquivo não encontrado")
+
+    return FileResponse(output_path, filename="merged.pdf", media_type="application/pdf")
