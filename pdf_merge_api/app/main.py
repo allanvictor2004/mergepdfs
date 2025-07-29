@@ -4,28 +4,29 @@ from typing import List
 from PyPDF2 import PdfMerger
 import uuid
 import os
-import io
 
 app = FastAPI()
 
-# Pasta temporária para salvar PDFs
 TEMP_DIR = "/tmp/pdf_merge"
 os.makedirs(TEMP_DIR, exist_ok=True)
 
-tasks_status = {}  # {task_id: "pending" | "done" | "error"}
+tasks_status = {}
 
-def process_merge(task_id: str, files_content: List[bytes]):
-    """Função que faz o merge em segundo plano."""
+def process_merge(task_id: str, files_paths: List[str]):
+    """Processa os PDFs no background"""
     try:
         merger = PdfMerger()
-        for content in files_content:
-            merger.append(io.BytesIO(content))
+        for path in files_paths:
+            merger.append(path)
 
         output_path = os.path.join(TEMP_DIR, f"{task_id}.pdf")
-        with open(output_path, "wb") as f:
-            merger.write(f)
-
+        merger.write(output_path)
         merger.close()
+
+        # Apaga arquivos temporários enviados
+        for path in files_paths:
+            os.remove(path)
+
         tasks_status[task_id] = "done"
     except Exception as e:
         tasks_status[task_id] = "error"
@@ -33,15 +34,19 @@ def process_merge(task_id: str, files_content: List[bytes]):
 
 @app.post("/merge-pdfs")
 async def merge_pdfs(background_tasks: BackgroundTasks, files: List[UploadFile] = File(...)):
-    # Gera um ID único para a tarefa
     task_id = str(uuid.uuid4())
     tasks_status[task_id] = "pending"
 
-    # Lê os arquivos (conteúdo em memória)
-    files_content = [await file.read() for file in files]
+    # Salva os arquivos no disco rapidamente e retorna
+    file_paths = []
+    for file in files:
+        temp_path = os.path.join(TEMP_DIR, f"{uuid.uuid4()}.pdf")
+        with open(temp_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+        file_paths.append(temp_path)
 
-    # Chama o processamento em background
-    background_tasks.add_task(process_merge, task_id, files_content)
+    background_tasks.add_task(process_merge, task_id, file_paths)
 
     return {"task_id": task_id, "status": "pending", "download_url": f"/download/{task_id}"}
 
